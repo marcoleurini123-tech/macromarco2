@@ -3,10 +3,11 @@ import pandas as pd
 import yfinance as yf
 import numpy as np
 import requests
+from datetime import datetime, timedelta
 
-# ---------------------------------------------------------
-# IMPOSTAZIONI PIATTAFORMA
-# ---------------------------------------------------------
+# =========================================================
+# CONFIGURAZIONE PIATTAFORMA
+# =========================================================
 st.set_page_config(
     page_title="Macro & Quant Terminal",
     page_icon="🌐",
@@ -14,9 +15,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ---------------------------------------------------------
-# 1. MODULO VISIVO: SCENARI MACRO (7 PORTAFOGLI EOD)
-# ---------------------------------------------------------
+# =========================================================
+# 1. MODULO REGIME MACRO DOMINANTE (7 PORTAFOGLI EOD)
+# =========================================================
 MACRO_BASKETS = {
     "GOLDILOCKS": ["QQQ", "XLK", "XLY", "IEF", "SMH"],
     "RECESSIONE": ["TLT", "SHY", "XLU", "XLP", "GLD"],
@@ -30,15 +31,27 @@ MACRO_BASKETS = {
 @st.cache_data(ttl=3600 * 12)
 def get_macro_dominant():
     all_tickers = sorted(list({t for b in MACRO_BASKETS.values() for t in b}))
-    df = yf.download(all_tickers, period="3mo", interval="1d", progress=False)['Close']
+    df = yf.download(all_tickers, period="6mo", interval="1d", progress=False)['Close']
     df = df.ffill().dropna()
 
     perf_1m = {}
+    details = []
     for scenario, tickers in MACRO_BASKETS.items():
         valid = [t for t in tickers if t in df.columns]
         sub = df[valid]
-        ret_mean = ((sub.iloc[-1] / sub.iloc[-21] - 1) * 100).mean()
-        perf_1m[scenario] = ret_mean
+        r1d = ((sub.iloc[-1] / sub.iloc[-2] - 1) * 100).mean() if len(sub) > 1 else 0
+        r1w = ((sub.iloc[-1] / sub.iloc[-6] - 1) * 100).mean() if len(sub) > 5 else 0
+        r1m = ((sub.iloc[-1] / sub.iloc[-21] - 1) * 100).mean() if len(sub) > 20 else 0
+        r3m = ((sub.iloc[-1] / sub.iloc[-63] - 1) * 100).mean() if len(sub) > 62 else 0
+        
+        perf_1m[scenario] = r1m
+        details.append({
+            "Scenario": scenario,
+            "1D %": r1d,
+            "1W %": r1w,
+            "1M %": r1m,
+            "3M %": r3m
+        })
 
     series_perf = pd.Series(perf_1m)
     dominant_scenario = series_perf.idxmax()
@@ -47,13 +60,14 @@ def get_macro_dominant():
     probabilities = (exp_vals / exp_vals.sum()) * 100
     confidence = int(probabilities[dominant_scenario])
 
-    return dominant_scenario, confidence, series_perf
+    df_details = pd.DataFrame(details).set_index("Scenario")
+    return dominant_scenario, confidence, df_details
 
 def render_macro_card():
     try:
-        dominant, confidence, _ = get_macro_dominant()
+        dominant, confidence, df_details = get_macro_dominant()
     except Exception:
-        dominant, confidence = "CALCOLO IN CORSO...", 50
+        dominant, confidence, df_details = "CALCOLO IN CORSO...", 50, pd.DataFrame()
     
     st.markdown("""
         <style>
@@ -62,7 +76,7 @@ def render_macro_card():
             border-radius: 12px;
             padding: 20px 24px;
             border: 1px solid #1E293B;
-            margin-bottom: 25px;
+            margin-bottom: 20px;
             color: #FFFFFF;
             font-family: sans-serif;
         }
@@ -142,10 +156,73 @@ def render_macro_card():
             </div>
         </div>
     """, unsafe_allow_html=True)
+    return df_details
 
-# ---------------------------------------------------------
-# 2. FUNZIONE ALERT TELEGRAM
-# ---------------------------------------------------------
+# =========================================================
+# 2. MODULO LIQUIDITÀ FED & FRED DATA (EOD)
+# =========================================================
+@st.cache_data(ttl=3600 * 12)
+def get_fred_liquidity_data():
+    def fetch_series(series_id):
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        df = pd.read_csv(url, index_col=0, parse_dates=True)
+        df.columns = [series_id]
+        df[series_id] = pd.to_numeric(df[series_id], errors='coerce')
+        return df.dropna()
+
+    walcl = fetch_series("WALCL")      # Total Assets (Millions)
+    rrp = fetch_series("RRPONTSYD")    # Reverse Repo (Billions)
+    tga = fetch_series("WTREGEN")      # TGA (Billions)
+    t10y2y = fetch_series("T10Y2Y")    # 10Y-2Y Spread
+
+    walcl_b = walcl / 1000.0           # Convert Millions to Billions
+    combined = pd.concat([walcl_b, rrp, tga, t10y2y], axis=1).ffill().dropna()
+    combined.columns = ["WALCL", "RRP", "TGA", "T10Y2Y"]
+    combined["Fed_Net_Liquidity"] = combined["WALCL"] - combined["RRP"] - combined["TGA"]
+    return combined
+
+def render_fed_liquidity_section():
+    st.markdown("### 🌐 Regime Macroeconomico & Liquidità Fed")
+    st.caption("Monitoraggio delle condizioni monetarie globali: Total Assets, Reverse Repo, TGA e Yield Curve.")
+
+    try:
+        data = get_fred_liquidity_data()
+        latest = data.iloc[-1]
+        prev_year = data.iloc[-252] if len(data) > 252 else data.iloc[0]
+
+        net_liq = latest["Fed_Net_Liquidity"]
+        net_liq_yoy = ((net_liq / prev_year["Fed_Net_Liquidity"]) - 1) * 100
+        spread_10_2 = latest["T10Y2Y"]
+        total_assets = latest["WALCL"]
+        rrp = latest["RRP"]
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric(
+                label="Fed Net Liquidity",
+                value=f"${net_liq:,.1f} B",
+                delta=f"{net_liq_yoy:+.2f}% YoY"
+            )
+            st.metric(
+                label="Total Fed Assets",
+                value=f"${total_assets:,.1f} B"
+            )
+        with col2:
+            st.metric(
+                label="Spread 10Y - 2Y",
+                value=f"{spread_10_2:.2f}%",
+                delta="Disinversione" if spread_10_2 > 0 else "Inversione"
+            )
+            st.metric(
+                label="Reverse Repo (RRP)",
+                value=f"${rrp:,.1f} B"
+            )
+    except Exception as e:
+        st.warning("Caricamento dati FED in corso...")
+
+# =========================================================
+# 3. MODULO TELEGRAM ALERTS & SCREENER
+# =========================================================
 def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
@@ -155,9 +232,6 @@ def send_telegram(bot_token: str, chat_id: str, message: str) -> bool:
     except Exception:
         return False
 
-# ---------------------------------------------------------
-# 3. MODULO SCREENER QUANTITATIVO (DATI EOD)
-# ---------------------------------------------------------
 def run_screener(tickers: list, bot_token: str, chat_id: str):
     matched = []
     data = yf.download(tickers, period="6mo", interval="1d", progress=False)
@@ -172,7 +246,6 @@ def run_screener(tickers: list, bot_token: str, chat_id: str):
         sma50 = float(series.rolling(50).mean().iloc[-1])
         prev = float(series.iloc[-2])
         
-        # Esempio Criterio Quant: Breakout sopra la media a 50 periodi EOD
         if current > sma50 and prev <= sma50:
             matched.append({"Ticker": t, "Prezzo EOD": round(current, 2), "Condizione": "Breakout sopra SMA 50"})
 
@@ -186,23 +259,40 @@ def run_screener(tickers: list, bot_token: str, chat_id: str):
         
     return df_res
 
-# ---------------------------------------------------------
+# =========================================================
 # INTERFACCIA PRINCIPALE
-# ---------------------------------------------------------
+# =========================================================
 st.title("Panoramica Macro e Mercati")
 
-# 1. Card Stile Quantaste (sempre visibile come widget puro)
-render_macro_card()
+# 1. Card Stile Quantaste sempre in cima
+df_macro_details = render_macro_card()
 
-# 2. Gestione Moduli Separati (Barra Laterale)
-st.sidebar.title("🛠 Protocolli Operativi")
-protocollo = st.sidebar.radio(
-    "Seleziona Protocollo Attivo:",
-    ["Dashboard Standby (Solo Macro)", "Screener Titoli EOD + Alert Telegram"]
+# 2. Selettore Moduli nella Sidebar
+st.sidebar.title("🛠 Moduli & Protocolli")
+modulo = st.sidebar.radio(
+    "Seleziona Vista:",
+    [
+        "Panoramica Generale (Macro + Fed)",
+        "Dettagli 7 Scenari Macro (ETF)",
+        "Screener Azionario EOD + Alert Telegram"
+    ]
 )
 
-if protocollo == "Screener Titoli EOD + Alert Telegram":
-    st.subheader("🎯 Monitoraggio Watchlist & Alert Telegram")
+if modulo == "Panoramica Generale (Macro + Fed)":
+    # Ripristino sezione liquidità Fed
+    render_fed_liquidity_section()
+
+elif modulo == "Dettagli 7 Scenari Macro (ETF)":
+    st.subheader("📊 Analisi Dettagliata Panieri Macro")
+    if not df_macro_details.empty:
+        st.dataframe(
+            df_macro_details.style.format("{:+.2f}%")
+            .background_gradient(cmap="RdYlGn", subset=["1D %", "1W %", "1M %", "3M %"]),
+            use_container_width=True
+        )
+
+elif modulo == "Screener Azionario EOD + Alert Telegram":
+    st.subheader("🎯 Monitoraggio Watchlist & Invio Telegram")
     
     col_t1, col_t2 = st.columns(2)
     bot_token = col_t1.text_input("Telegram Bot Token:", type="password", placeholder="123456789:ABC...")
@@ -215,12 +305,12 @@ if protocollo == "Screener Titoli EOD + Alert Telegram":
     tickers_list = [x.strip().upper() for x in watchlist_str.split(",") if x.strip()]
     
     if st.button("🚀 Esegui Protocollo Screener"):
-        with st.spinner("Scaricamento dati EOD e verifica condizioni in corso..."):
+        with st.spinner("Elaborazione dati EOD in corso..."):
             df_signals = run_screener(tickers_list, bot_token, chat_id)
             if not df_signals.empty:
                 st.success(f"Trovati {len(df_signals)} titoli conformi!")
                 st.dataframe(df_signals, use_container_width=True)
                 if bot_token and chat_id:
-                    st.info("Notifica inviata con successo sul canale Telegram.")
+                    st.info("Notifica inviata sul canale Telegram.")
             else:
-                st.warning("Nessun titolo della watchlist soddisfa attualmente i criteri del protocollo.")
+                st.warning("Nessun titolo soddisfa i criteri del protocollo.")
